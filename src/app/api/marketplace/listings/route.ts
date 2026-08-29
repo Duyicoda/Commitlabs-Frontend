@@ -26,6 +26,13 @@ const COMMITMENT_TYPES: readonly MarketplaceCommitmentType[] = [
   'Aggressive',
 ] as const;
 
+const MAX_LISTINGS_PAGE = 1000;
+const MAX_LISTINGS_PAGE_SIZE = 100;
+const MAX_COMPLIANCE = 100;
+const MIN_COMPLIANCE = 0;
+const MAX_LOSS_PERCENT = 100;
+const MIN_LOSS_PERCENT = 0;
+
 interface ParseResult {
   type?: MarketplaceCommitmentType;
   minCompliance?: number;
@@ -85,6 +92,31 @@ function parseQuery(searchParams: URLSearchParams): ParseResult {
       "Invalid amount filter. 'minAmount' cannot be greater than 'maxAmount'.",
     );
   }
+  if (minAmount !== undefined && minAmount < 0) {
+    throw new ValidationError("'minAmount' must be non-negative.");
+  }
+  if (maxAmount !== undefined && maxAmount < 0) {
+    throw new ValidationError("'maxAmount' must be non-negative.");
+  }
+
+  const minCompliance = parseOptionalNumber(searchParams, 'minCompliance');
+  const maxLoss = parseOptionalNumber(searchParams, 'maxLoss');
+  if (
+    minCompliance !== undefined &&
+    (minCompliance < MIN_COMPLIANCE || minCompliance > MAX_COMPLIANCE)
+  ) {
+    throw new ValidationError(
+      `'minCompliance' must be between ${MIN_COMPLIANCE} and ${MAX_COMPLIANCE}.`,
+    );
+  }
+  if (
+    maxLoss !== undefined &&
+    (maxLoss < MIN_LOSS_PERCENT || maxLoss > MAX_LOSS_PERCENT)
+  ) {
+    throw new ValidationError(
+      `'maxLoss' must be between ${MIN_LOSS_PERCENT} and ${MAX_LOSS_PERCENT}.`,
+    );
+  }
 
   const sortBy = searchParams.get('sortBy') ?? undefined;
   if (sortBy && !isMarketplaceSortBy(sortBy)) {
@@ -94,11 +126,20 @@ function parseQuery(searchParams: URLSearchParams): ParseResult {
   }
 
   const { page, pageSize } = parseBoundedPagination(searchParams);
+  if (page !== undefined && page < 1) {
+    throw new ValidationError("'page' must be a positive integer.");
+  }
+  if (page !== undefined && page > MAX_LISTINGS_PAGE) {
+    throw new ValidationError(`'page' exceeds maximum of ${MAX_LISTINGS_PAGE}.`);
+  }
+  if (pageSize !== undefined && pageSize > MAX_LISTINGS_PAGE_SIZE) {
+    throw new ValidationError(`'pageSize' exceeds maximum of ${MAX_LISTINGS_PAGE_SIZE}.`);
+  }
 
   return {
     type: parseType(searchParams),
-    minCompliance: parseOptionalNumber(searchParams, 'minCompliance'),
-    maxLoss: parseOptionalNumber(searchParams, 'maxLoss'),
+    minCompliance,
+    maxLoss,
     minAmount,
     maxAmount,
     sortBy,
@@ -141,6 +182,7 @@ export const GET = withApiHandler(
         200,
         correlationId,
       );
+      response.headers.set('Cache-Control', 'private, max-age=60, stale-while-revalidate=30');
       emitMarketplaceTelemetry({
         event: 'marketplace.listings.get.success',
         correlationId,
@@ -148,6 +190,8 @@ export const GET = withApiHandler(
         path: '/api/marketplace/listings',
         statusCode: 200,
         latencyMs: Date.now() - startedAt,
+        page: filters.page,
+        pageSize: filters.pageSize,
       });
       return response;
     } catch (error) {
@@ -201,6 +245,7 @@ export const POST = withApiHandler(
       const listing = await marketplaceService.createListing(request);
       const response: CreateListingResponse = { listing };
       const apiResponse = ok(response, undefined, 201, correlationId);
+      apiResponse.headers.set('Cache-Control', 'no-store');
       emitMarketplaceTelemetry({
         event: 'marketplace.listings.post.success',
         correlationId,
