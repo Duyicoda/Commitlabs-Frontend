@@ -15,12 +15,16 @@ import { emitMarketplaceTelemetry } from '@/lib/marketplace/telemetry';
 import { MARKETPLACE_PURCHASE_JSON_BODY_LIMIT_BYTES, MARKETPLACE_RATE_LIMIT_ACTIONS } from '@/lib/marketplace/constants';
 
 const PurchaseRequestSchema = w.object({
-  buyerAddress: w.string().min(1, 'buyerAddress is required'),
+  buyerAddress: w.string().min(1, 'buyerAddress is required').trim(),
 });
 
 const MARKETPLACE_PURCHASE_CORS_POLICY = {
   POST: { access: 'first-party' },
 } satisfies CorsRoutePolicy;
+
+const IDEMPOTENCY_KEY_HEADER = 'idempotency-key';
+const MAX_IDEMPOTENCY_KEY_LENGTH = 128;
+const CACHE_CONTROL_NO_STORE = 'no-store';
 
 export const OPTIONS = createCorsOptionsHandler(MARKETPLACE_PURCHASE_CORS_POLICY);
 
@@ -59,11 +63,23 @@ export const POST = withApiHandler(
 
       const buyerAddress = validation.data.buyerAddress;
 
+      const idempotencyKey = req.headers.get(IDEMPOTENCY_KEY_HEADER);
+      if (idempotencyKey !== null && idempotencyKey.length > MAX_IDEMPOTENCY_KEY_LENGTH) {
+        throw new ValidationError('Idempotency-Key header is too long', [
+          {
+            path: ['idempotencyKey'],
+            message: `Maximum length is ${MAX_IDEMPOTENCY_KEY_LENGTH}`,
+          },
+        ]);
+      }
+
+      const effectiveCorrelationId = idempotencyKey ?? true;
+
       const { listing: purchasedListing, transfer, commitmentId, sellerAddress } =
         await marketplaceService.purchaseListing({
           listingId,
           buyerAddress,
-          correlationId,
+          correlationId: effectiveCorrelationId,
         });
 
       const responseData = {
@@ -75,26 +91,32 @@ export const POST = withApiHandler(
         purchasedAt: purchasedListing.updatedAt,
       };
 
-      const response = ok(responseData, undefined, 200, correlationId);
+      const response = ok(responseData, undefined, 200, effectiveCorrelationId);
+      response.headers.set('Cache-Control', CACHE_CONTROL_NO_STORE);
       emitMarketplaceTelemetry({
         event: 'marketplace.purchase.api.succeeded',
-        correlationId,
+        correlationId: effectiveCorrelationId,
         method: 'POST',
         path: '/api/marketplace/listings/[id]/purchase',
         statusCode: 200,
         latencyMs: Date.now() - startedAt,
+        listingId: purchasedListing.id,
       });
       return response;
     } catch (error) {
       const err = error as { code?: string; status?: number };
+      const errorName = error instanceof Error ? error.name : 'UnknownError';
+      const statusCode = err.status ?? 500;
+      const retryable = statusCode === 429 || statusCode >= 500;
       emitMarketplaceTelemetry({
         event: 'marketplace.purchase.api.failed',
         correlationId,
         method: 'POST',
         path: '/api/marketplace/listings/[id]/purchase',
-        errorCode: err.code,
-        statusCode: err.status ?? 500,
+        errorCode: err.code ?? errorName,
+        statusCode,
         latencyMs: Date.now() - startedAt,
+        retryable,
       });
       throw error;
     }
