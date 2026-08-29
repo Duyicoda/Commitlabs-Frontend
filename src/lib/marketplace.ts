@@ -1,4 +1,4 @@
-import { ConflictError, ForbiddenError, NotFoundError, TooManyRequestsError } from '@/lib/backend/errors';
+import { ConflictError, ForbiddnError, NotFoundError, TooManyRequestsError } from '@/lib/backend/errors';
 import { transferOwnership } from '@/lib/backend/services/contracts';
 import {
   listMarketplaceListings as backendListMarketplaceListings,
@@ -12,30 +12,38 @@ import { emitMarketplaceTelemetry } from '@/lib/marketplace/telemetry';
 
 const purchaseLocks = new Map<string, Promise<unknown>>();
 
+// Bounds for listing pagination.
+const MARKETAPLACE_DEFAULT_PAGE_SIZE = 20;
+const MARKETPLACE_MAX_PAGE_SIZE = 100;
+
+function normalizePageAndPageSize(page?: number, pageSize?: number): { page: number; pageSize: number } {
+  const normalizedPage = Math.max(1, Math.floor(page ?? 1));
+  const normalizedPageSize = Math.min(MARKETAPLACE_MAX_PAGE_SIZE, Math.max(1, Math.floor(pageSize ?? MARKETAPLACE_DEFAULT_PAGE_SIZE)));
+  return { page: normalizedPage, pageSize: normalizedPageSize };
+}
+
 async function withPurchaseLock<T>(key: string, action: () => Promise<T>): Promise<T> {
-  if (!purchaseLocks.has(key) && purchaseLocks.size >= MARKETPLACE_MAX_CONCURRENT_PURCHASE_LOCKS) {
+  // Reject duplicate purchase attempts for the same listing to avoid redundant
+  // state changes and unbounded queueing.
+  if (purchaseLocks.has(key)) {
+    throw new ConflictError('A purchase for this listing is already in progress', { listingId: key });
+  }
+
+  // Bound the total number of concurrent purchase operations across listings.
+  if (purchaseLocks.size >= MARKETAPLACE_MAX_CONCURRENT_PURCHASE_LOCKS) {
     throw new TooManyRequestsError('Too many concurrent purchase requests. Please try again later.');
   }
-  const previous = purchaseLocks.get(key) ?? Promise.resolve();
-  let release!(: void => void);
-  const current = previous
-    .catch(() => undefined)
-    .then(
-      () =>
-        new Promise<void>((resolve) => {
-          release = resolve;
-        }),
-    )
-    .then(action);
-  purchaseLocks.set(key, current);
-  try {
-    return await current;
-  } finally {
-    release?.();
-    if (purchaseLocks.get(key) === current) {
+
+  const operation = (async () => {
+    try {
+      return await action();
+    } finally {
       purchaseLocks.delete(key);
     }
-  }
+  })();
+
+  purchaseLocks.set(key, operation);
+  return operation;
 }
 
 export const marketplaceService = {
@@ -62,6 +70,8 @@ export const marketplaceService = {
   }) {
     return withPurchaseLock(listingId, async () => {
       const startedAt = Date.now();
+      let recovered = false;
+
       try {
         const listing = await backendMarketplaceService.getListing(listingId);
         if (!listing) {
@@ -87,9 +97,12 @@ export const marketplaceService = {
         try {
           purchasedListing = await backendMarketplaceService.completePurchase(listingId, buyerAddress);
         } catch (error) {
+          // If the purchase was actually committed but the response was lost,
+          // recover by refreshing the listing state.
           const refreshed = await backendMarketplaceService.getListing(listingId);
           if (refreshed && refreshed.sellerAddress === buyerAddress && refreshed.status !== 'Active') {
             purchasedListing = refreshed;
+            recovered = true;
           } else {
             throw error;
           }
@@ -99,7 +112,11 @@ export const marketplaceService = {
           event: 'marketplace.purchase.succeeded',
           correlationId,
           latencyMs: Date.now() - startedAt,
-          details: { listingId },
+          details: {
+            listingId,
+            recovered,
+            status: purchasedListing?.status,
+          },
         });
 
         return {
@@ -116,7 +133,7 @@ export const marketplaceService = {
           errorCode: err.code,
           statusCode: err.status ?? 500,
           latencyMs: Date.now() - startedAt,
-          details: { listingId },
+          details: { listingId, recovered },
         });
         throw error;
       }
@@ -136,5 +153,11 @@ export async function listMarketplaceListings(
     pageSize?: number;
   },
 ) {
-  return backendListMarketplaceListings(filters);
+  const { page, pageSize, ...rest } = filters;
+  const normalized = normalizePageAndPageSize(page, pageSize);
+  return backendListMarketplaceListings({
+    ...rest,
+    page: normalized.page,
+    pageSize: normalized.pageSize,
+  });
 }
