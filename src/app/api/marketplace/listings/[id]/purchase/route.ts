@@ -25,12 +25,36 @@ const MARKETPLACE_PURCHASE_CORS_POLICY = {
 const IDEMPOTENCY_KEY_HEADER = 'idempotency-key';
 const MAX_IDEMPOTENCY_KEY_LENGTH = 128;
 const CACHE_CONTROL_NO_STORE = 'no-store';
+const MAX_CONCURRENT_PURCHASES = 10;
+let activePurchases = 0;
 
 export const OPTIONS = createCorsOptionsHandler(MARKETPLACE_PURCHASE_CORS_POLICY);
 
 export const POST = withApiHandler(
   async (req: NextRequest, { params }, correlationId) => {
     const startedAt = Date.now();
+    if (activePurchases >= MAX_CONCURRENT_PURCHASES) {
+      emitMarketplaceTelemetry({
+        event: 'marketplace.purchase.api.saturated',
+        effectiveCorrelationId,
+        method: 'POST',
+        path: '/api/marketplace/listings/[id]/purchase',
+        statusCode: 429,
+        latencyMs: Date.now() - startedAt,
+        retryable: true,
+      });
+      return NextResponse.json(
+        {
+          error: {
+            code: 'TOO_MANY_REQUESTS',
+            message: 'Too many concurrent purchase requests. Please retry.',
+          },
+        },
+        { status: 429 },
+      );
+    }
+    activePurchases++;
+    let effectiveCorrelationId = correlationId;
     try {
       if (!isFeatureEnabled('marketplace')) {
         return NextResponse.json(
@@ -73,7 +97,9 @@ export const POST = withApiHandler(
         ]);
       }
 
-      const effectiveCorrelationId = idempotencyKey ?? true;
+      if (idempotencyKey !== null) {
+        effectiveCorrelationId = idempotencyKey;
+      }
 
       const { listing: purchasedListing, transfer, commitmentId, sellerAddress } =
         await marketplaceService.purchaseListing({
@@ -119,6 +145,8 @@ export const POST = withApiHandler(
         retryable,
       });
       throw error;
+    } finally {
+      activePurchases--;
     }
   },
   { cors: MARKETPLACE_PURCHASE_CORS_POLICY },
