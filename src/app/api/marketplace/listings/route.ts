@@ -3,20 +3,22 @@ import { ok, methodNotAllowed } from '@/lib/backend/apiResponse';
 import { isFeatureEnabled } from '@/lib/backend/config';
 import { assertMutationCsrf } from '@/lib/backend/csrf';
 import { createCorsOptionsHandler, type CorsRoutePolicy } from '@/lib/backend/cors';
-import { TooManyRequestsError, ValidationError } from '@/lib/backend/errors';
+import { ValidationError } from '@/lib/backend/errors';
 import { getClientIp } from '@/lib/backend/getClientIp';
 import { parseJsonWithLimit, JSON_BODY_LIMITS } from '@/lib/backend/jsonBodyLimit';
-import { checkRateLimit, getRateLimitWindowSeconds } from '@/lib/backend/rateLimit';
 import {
   getMarketplaceSortKeys,
   isMarketplaceSortBy,
-  listMarketplaceListings,
-  marketplaceService,
   type MarketplaceCommitmentType,
   type MarketplacePublicListing,
 } from '@/lib/backend/services/marketplace';
 import { withApiHandler } from '@/lib/backend/withApiHandler';
 import type { CreateListingRequest, CreateListingResponse } from '@/types/marketplace';
+import { MARKETPLACE_RATE_LIMIT_ACTIONS } from '@/lib/marketplace/constants';
+import { listMarketplaceListings, marketplaceService } from '@/lib/marketplace';
+import { enforceMarketplaceRateLimit } from '@/lib/marketplace/rate-limit';
+import { emitMarketplaceTelemetry } from '@/lib/marketplace/telemetry';
+import { parseBoundedPagination, parseOptionalNumber } from '@/lib/marketplace/validation';
 
 const COMMITMENT_TYPES: readonly MarketplaceCommitmentType[] = [
   'Safe',
@@ -55,26 +57,6 @@ function toMarketplaceCard(listing: MarketplacePublicListing) {
   };
 }
 
-function parseNumber(searchParams: URLSearchParams, key: string): number | undefined {
-  const raw = searchParams.get(key);
-  if (raw === null) return undefined;
-  const parsed = Number(raw);
-  if (!Number.isFinite(parsed) || Number.isNaN(parsed)) {
-    throw new ValidationError(`Invalid '${key}' query param. Expected a number.`);
-  }
-  return parsed;
-}
-
-function parseInteger(searchParams: URLSearchParams, key: string, defaultValue: number): number {
-  const raw = searchParams.get(key);
-  if (raw === null) return defaultValue;
-  const parsed = Number(raw);
-  if (!Number.isFinite(parsed) || !Number.isInteger(parsed) || parsed < 1) {
-    throw new ValidationError(`Invalid '${key}' query param. Expected a positive integer.`);
-  }
-  return parsed;
-}
-
 function parseType(searchParams: URLSearchParams): MarketplaceCommitmentType | undefined {
   const raw = searchParams.get('type');
   if (raw === null) return undefined;
@@ -96,8 +78,8 @@ function parseType(searchParams: URLSearchParams): MarketplaceCommitmentType | u
 }
 
 function parseQuery(searchParams: URLSearchParams): ParseResult {
-  const minAmount = parseNumber(searchParams, 'minAmount');
-  const maxAmount = parseNumber(searchParams, 'maxAmount');
+  const minAmount = parseOptionalNumber(searchParams, 'minAmount');
+  const maxAmount = parseOptionalNumber(searchParams, 'maxAmount');
   if (minAmount !== undefined && maxAmount !== undefined && minAmount > maxAmount) {
     throw new ValidationError(
       "Invalid amount filter. 'minAmount' cannot be greater than 'maxAmount'.",
@@ -111,94 +93,136 @@ function parseQuery(searchParams: URLSearchParams): ParseResult {
     );
   }
 
+  const { page, pageSize } = parseBoundedPagination(searchParams);
+
   return {
     type: parseType(searchParams),
-    minCompliance: parseNumber(searchParams, 'minCompliance'),
-    maxLoss: parseNumber(searchParams, 'maxLoss'),
+    minCompliance: parseOptionalNumber(searchParams, 'minCompliance'),
+    maxLoss: parseOptionalNumber(searchParams, 'maxLoss'),
     minAmount,
     maxAmount,
     sortBy,
-    page: parseInteger(searchParams, 'page', 1),
-    pageSize: parseInteger(searchParams, 'pageSize', 10),
+    page,
+    pageSize,
   };
 }
 
 export const GET = withApiHandler(
   async (req: NextRequest, _context, correlationId) => {
-    if (!isFeatureEnabled('marketplace')) {
-      return NextResponse.json(
-        {
-          error: {
-            code: 'NOT_FOUND',
-            message: 'Marketplace feature is disabled.',
-            details: { feature: 'marketplace' },
+    const startedAt = Date.now();
+    try {
+      if (!isFeatureEnabled('marketplace')) {
+        return NextResponse.json(
+          {
+            error: {
+              code: 'NOT_FOUND',
+              message: 'Marketplace feature is disabled.',
+              details: { feature: 'marketplace' },
+            },
           },
+          { status: 404 },
+        );
+      }
+
+      const ip = getClientIp(req);
+      await enforceMarketplaceRateLimit(ip, MARKETPLACE_RATE_LIMIT_ACTIONS.LIST);
+
+      const { searchParams } = new URL(req.url);
+      const filters = parseQuery(searchParams);
+      const listings = await listMarketplaceListings(filters);
+
+      const response = ok(
+        {
+          listings,
+          cards: listings.map(toMarketplaceCard),
+          total: listings.length,
         },
-        { status: 404 },
+        undefined,
+        200,
+        correlationId,
       );
+      emitMarketplaceTelemetry({
+        event: 'marketplace.listings.get.success',
+        correlationId,
+        method: 'GET',
+        path: '/api/marketplace/listings',
+        statusCode: 200,
+        latencyMs: Date.now() - startedAt,
+      });
+      return response;
+    } catch (error) {
+      const err = error as { code?: string; status?: number };
+      emitMarketplaceTelemetry({
+        event: 'marketplace.listings.get.failed',
+        correlationId,
+        method: 'GET',
+        path: '/api/marketplace/listings',
+        errorCode: err.code,
+        statusCode: err.status ?? 500,
+        latencyMs: Date.now() - startedAt,
+      });
+      throw error;
     }
-
-    const ip = getClientIp(req);
-    if (!(await checkRateLimit(ip, 'api/marketplace/listings'))) {
-      throw new TooManyRequestsError();
-    }
-
-    const { searchParams } = new URL(req.url);
-    const filters = parseQuery(searchParams);
-    const listings = await listMarketplaceListings(filters);
-
-    return ok(
-      {
-        listings,
-        cards: listings.map(toMarketplaceCard),
-        total: listings.length,
-      },
-      undefined,
-      200,
-      correlationId,
-    );
   },
   { cors: MARKETPLACE_LISTINGS_CORS_POLICY, enableETag: true },
 );
 
 export const POST = withApiHandler(
   async (req: NextRequest, _context, correlationId) => {
-    if (!isFeatureEnabled('marketplace')) {
-      return NextResponse.json(
-        {
-          error: {
-            code: 'NOT_FOUND',
-            message: 'Marketplace feature is disabled.',
-            details: { feature: 'marketplace' },
+    const startedAt = Date.now();
+    try {
+      if (!isFeatureEnabled('marketplace')) {
+        return NextResponse.json(
+          {
+            error: {
+              code: 'NOT_FOUND',
+              message: 'Marketplace feature is disabled.',
+              details: { feature: 'marketplace' },
+            },
           },
-        },
-        { status: 404 },
-      );
+          { status: 404 },
+        );
+      }
+
+      assertMutationCsrf(req);
+
+      const ip = getClientIp(req);
+      await enforceMarketplaceRateLimit(ip, MARKETPLACE_RATE_LIMIT_ACTIONS.CREATE);
+
+      const body = await parseJsonWithLimit(req, {
+        limitBytes: JSON_BODY_LIMITS.marketplaceListingsCreate,
+      });
+
+      if (!body || typeof body !== 'object') {
+        throw new ValidationError('Request body must be an object');
+      }
+
+      const request = body as CreateListingRequest;
+      const listing = await marketplaceService.createListing(request);
+      const response: CreateListingResponse = { listing };
+      const apiResponse = ok(response, undefined, 201, correlationId);
+      emitMarketplaceTelemetry({
+        event: 'marketplace.listings.post.success',
+        correlationId,
+        method: 'POST',
+        path: '/api/marketplace/listings',
+        statusCode: 201,
+        latencyMs: Date.now() - startedAt,
+      });
+      return apiResponse;
+    } catch (error) {
+      const err = error as { code?: string; status?: number };
+      emitMarketplaceTelemetry({
+        event: 'marketplace.listings.post.failed',
+        correlationId,
+        method: 'POST',
+        path: '/api/marketplace/listings',
+        errorCode: err.code,
+        statusCode: err.status ?? 500,
+        latencyMs: Date.now() - startedAt,
+      });
+      throw error;
     }
-
-    assertMutationCsrf(req);
-
-    const ip = getClientIp(req);
-    if (!(await checkRateLimit(ip, 'api/marketplace/listings/create'))) {
-      throw new TooManyRequestsError(
-        'Too many requests. Please try again later.',
-        undefined,
-        getRateLimitWindowSeconds('api/marketplace/listings/create'),
-      );
-    }
-
-    const body = await parseJsonWithLimit(req, {
-      limitBytes: JSON_BODY_LIMITS.marketplaceListingsCreate,
-    });
-
-    if (!body || typeof body !== 'object') {
-      throw new ValidationError('Request body must be an object');
-    }
-
-    const request = body as CreateListingRequest;
-    const listing = await marketplaceService.createListing(request);
-    const response: CreateListingResponse = { listing };
-    return ok(response, undefined, 201, correlationId);
   },
   { cors: MARKETPLACE_LISTINGS_CORS_POLICY },
 );
