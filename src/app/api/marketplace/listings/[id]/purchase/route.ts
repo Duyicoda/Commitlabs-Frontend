@@ -5,6 +5,7 @@ import { assertMutationCsrf } from '@/lib/backend/csrf';
 import { createCorsOptionsHandler, type CorsRoutePolicy } from '@/lib/backend/cors';
 import { ValidationError } from '@/lib/backend/errors';
 import { getClientIp } from '@/lib/backend/getClientIp';
+import { idempotencyService } from '@/lib/backend/idempotency';
 import { isFeatureEnabled } from '@/lib/backend/config';
 import { parseJsonWithLimit } from '@/lib/backend/jsonBodyLimit';
 import { withApiHandler } from '@/lib/backend/withApiHandler';
@@ -29,6 +30,22 @@ const MAX_CONCURRENT_PURCHASES = 10;
 let activePurchases = 0;
 
 export const OPTIONS = createCorsOptionsHandler(MARKETPLACE_PURCHASE_CORS_POLICY);
+
+function getScopedIdempotencyKey(
+  req: NextRequest,
+  listingId: string,
+  buyerAddress: string,
+): string | null {
+  const raw = req.headers.get('idempotency-key');
+  if (!raw) return null;
+
+  const result = IdempotencyKeySchema.safeParse(raw);
+  if (!result.success) {
+    throw new ValidationError('Invalid Idempotency-Key header', result.error.issues);
+  }
+
+  return `marketplace:purchase:${buyerAddress}:${listingId}:${result.data}`;
+}
 
 export const POST = withApiHandler(
   async (req: NextRequest, { params }, correlationId) => {

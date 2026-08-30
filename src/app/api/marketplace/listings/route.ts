@@ -5,6 +5,7 @@ import { assertMutationCsrf } from '@/lib/backend/csrf';
 import { createCorsOptionsHandler, type CorsRoutePolicy } from '@/lib/backend/cors';
 import { ValidationError } from '@/lib/backend/errors';
 import { getClientIp } from '@/lib/backend/getClientIp';
+import { idempotencyService } from '@/lib/backend/idempotency';
 import { parseJsonWithLimit, JSON_BODY_LIMITS } from '@/lib/backend/jsonBodyLimit';
 import {
   getMarketplaceSortKeys,
@@ -146,6 +147,15 @@ function parseQuery(searchParams: URLSearchParams): ParseResult {
     page,
     pageSize,
   };
+
+  if (type !== undefined) result.type = type;
+  if (minCompliance !== undefined) result.minCompliance = minCompliance;
+  if (maxLoss !== undefined) result.maxLoss = maxLoss;
+  if (minAmount !== undefined) result.minAmount = minAmount;
+  if (maxAmount !== undefined) result.maxAmount = maxAmount;
+  if (sortBy !== undefined) result.sortBy = sortBy;
+
+  return result;
 }
 
 export const GET = withApiHandler(
